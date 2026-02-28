@@ -502,7 +502,7 @@ class RoomFilterModel(QSortFilterProxyModel):
 
 # ── Detail / breeding panel widgets ──────────────────────────────────────────
 
-_CHIP_STYLE = ("QLabel { background:#252545; color:#ccc; border-radius:3px;"
+_CHIP_STYLE = ("QLabel { background:#252545; color:#ccc; border-radius:6px;"
                " padding:2px 7px; font-size:11px; }")
 _SEC_STYLE  = "color:#555; font-size:10px; font-weight:bold; letter-spacing:1px;"
 _NAME_STYLE = "color:#eee; font-size:13px; font-weight:bold;"
@@ -569,11 +569,13 @@ class CatDetailPanel(QWidget):
             self.setFixedHeight(0)
             return
 
+        min_h = 160 if len(cats) == 1 else 220
+        self.setMinimumHeight(min_h)
+        self.setMaximumHeight(16777215)   # remove the fixed-height lock
+
         if len(cats) == 1:
-            self.setFixedHeight(180)
             self._build_single(cats[0])
         else:
-            self.setFixedHeight(260)
             self._build_pair(cats[0], cats[1])
 
     # ── Single cat ─────────────────────────────────────────────────────────
@@ -735,9 +737,11 @@ class CatDetailPanel(QWidget):
                 name_lbl = QLabel(cat.name)
                 name_lbl.setStyleSheet("color:#ddd; font-size:11px; font-weight:bold;")
                 gen_lbl  = QLabel(cat.gender_display)
+                gen_lbl.setFixedWidth(20)
+                gen_lbl.setAlignment(Qt.AlignCenter)
                 gen_lbl.setStyleSheet(
-                    "color:#fff; background:#253555; border-radius:2px;"
-                    " padding:0px 4px; font-size:10px; font-weight:bold;")
+                    "color:#fff; background:#253555; border-radius:4px;"
+                    " font-size:10px; font-weight:bold;")
                 lbl_hb.addWidget(name_lbl)
                 lbl_hb.addWidget(gen_lbl)
             else:
@@ -796,12 +800,19 @@ class CatDetailPanel(QWidget):
         bot = QHBoxLayout()
         bot.setSpacing(20)
 
-        all_muts = list(dict.fromkeys(a.mutations + b.mutations))
-        if all_muts:
+        if a.mutations or b.mutations:
             mc = QVBoxLayout()
             mc.setSpacing(4)
-            mc.addWidget(_sec("POSSIBLE MUTATIONS"))
-            mc.addWidget(ChipRow(all_muts))
+            mc.addWidget(_sec("MUTATIONS"))
+            for cat in (a, b):
+                if cat.mutations:
+                    mrow = QHBoxLayout()
+                    mrow.setSpacing(5)
+                    mrow.addWidget(QLabel(f"{cat.name}:", styleSheet="color:#555; font-size:10px;"))
+                    for mut in cat.mutations:
+                        mrow.addWidget(_chip(mut))
+                    mrow.addStretch()
+                    mc.addLayout(mrow)
             mc.addStretch()
             bot.addLayout(mc)
             bot.addWidget(_vsep())
@@ -1005,8 +1016,11 @@ class MainWindow(QMainWindow):
         hb.addWidget(self._summary_lbl)
         vb.addWidget(hdr)
 
-        # Vertical splitter: table on top, detail panel on bottom
+        # Vertical splitter: table on top, detail panel on bottom (user-resizable)
         vs = QSplitter(Qt.Vertical)
+        vs.setHandleWidth(4)
+        vs.setStyleSheet("QSplitter::handle:vertical { background:#1e1e38; }")
+        self._detail_splitter = vs
         vb.addWidget(vs)
 
         # Table
@@ -1030,8 +1044,10 @@ class MainWindow(QMainWindow):
         hh = self._table.horizontalHeader()
         # Default: resize to contents
         hh.setSectionResizeMode(QHeaderView.ResizeToContents)
-        # Mutations and Abilities columns share the remaining space equally
-        hh.setSectionResizeMode(COL_MUTS, QHeaderView.Stretch)
+        # Mutations: interactive (user-resizable), reasonable default width
+        # Abilities: stretch to fill remaining space
+        hh.setSectionResizeMode(COL_MUTS, QHeaderView.Interactive)
+        self._table.setColumnWidth(COL_MUTS, 155)
         hh.setSectionResizeMode(COL_ABIL, QHeaderView.Stretch)
         # Narrow fixed columns
         for col, width in [(COL_GEN, _W_GEN), (COL_STAT, _W_STATUS)] + \
@@ -1078,7 +1094,12 @@ class MainWindow(QMainWindow):
             for idx in self._table.selectionModel().selectedRows()
         })
         cats = [c for r in rows[:2] if (c := self._source_model.cat_at(r)) is not None]
+        was_collapsed = self._detail.maximumHeight() == 0
         self._detail.show_cats(cats)
+        if cats and was_collapsed:
+            total   = self._detail_splitter.height()
+            panel_h = 200 if len(cats) == 1 else 300
+            self._detail_splitter.setSizes([max(10, total - panel_h), panel_h])
 
     # ── Filtering ──────────────────────────────────────────────────────────
 
