@@ -8,12 +8,15 @@ Requirements: pip install PySide6 lz4
 """
 
 import sys
+import re
 import struct
 import sqlite3
 import lz4.block
 import os
 from pathlib import Path
 from typing import Optional
+
+_IDENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -54,8 +57,8 @@ STAT_COLORS = {
 }
 
 ROOM_DISPLAY = {
-    "Floor1_Large":   "Ground Floor",
-    "Floor1_Small":   "Ground Floor (S)",
+    "Floor1_Large":   "Ground Floor Left",
+    "Floor1_Small":   "Ground Floor Right",
     "Floor2_Large":   "Second Floor",
     "Floor2_Small":   "Second Floor (S)",
     "Attic":          "Attic",
@@ -135,6 +138,33 @@ class BinaryReader:
         return len(self.data) - self.pos
 
 
+# ── Parent UID scanner ────────────────────────────────────────────────────────
+
+def _scan_blob_for_parent_uids(raw: bytes, uid_set: frozenset, self_uid: int) -> tuple[int, int]:
+    """
+    Scan the decompressed blob byte-by-byte looking for two consecutive u64
+    values (4-byte aligned) that are in uid_set and are not self_uid.
+    Parent UIDs appear early in the blob so we only scan the first 1 KB.
+    Returns (parent_a_uid, parent_b_uid), each 0 if not found.
+    """
+    if not uid_set:
+        return 0, 0
+    limit = min(1024, len(raw) - 16)
+    i = 12  # skip breed_id(4) + own uid(8)
+    while i <= limit - 16:
+        lo1, hi1 = struct.unpack_from('<II', raw, i)
+        v1 = lo1 + hi1 * 4_294_967_296
+        if v1 in uid_set and v1 != self_uid:
+            lo2, hi2 = struct.unpack_from('<II', raw, i + 8)
+            v2 = lo2 + hi2 * 4_294_967_296
+            if v2 in uid_set and v2 != self_uid:
+                return v1, v2          # both parents found
+            if v2 == 0:
+                return v1, 0           # one parent (other unknown)
+        i += 4  # u64-aligned steps
+    return 0, 0
+
+
 # ── Cat ───────────────────────────────────────────────────────────────────────
 
 class Cat:
@@ -146,6 +176,7 @@ class Cat:
         uncomp_size = struct.unpack('<I', blob[:4])[0]
         raw = lz4.block.decompress(blob[4:], uncompressed_size=uncomp_size)
         r   = BinaryReader(raw)
+        self._raw = raw   # kept for parent-UID blob scan in parse_save
 
         self.db_key = cat_key
 
@@ -162,14 +193,14 @@ class Cat:
 
         # Blob fields
         self.breed_id = r.u32()
-        self._uid_int = r.u64()            # store as int for ancestry lookup
+        self._uid_int = r.u64()            # cat's own unique id (seed)
         self.unique_id = hex(self._uid_int)
         self.name = r.utf16str()
 
-        r.str()  # unknown string
+        r.str()  # unknown string between name and parent refs
 
-        # The 16 bytes here are likely two parent uniqueIds (2 × u64).
-        # If they match another cat's uniqueId, parent links are resolved later.
+        # Possible parent UIDs — fixed-position attempt.
+        # parse_save will run a blob scan as a fallback if these don't resolve.
         self._parent_uid_a = r.u64()
         self._parent_uid_b = r.u64()
 
@@ -193,36 +224,111 @@ class Cat:
         self.total_stats = {n: self.stat_base[i] + self.stat_mod[i] + self.stat_sec[i]
                             for i, n in enumerate(STAT_NAMES)}
 
-        # Abilities (heuristic scan)
-        curr  = r.pos
-        found = -1
-        for i in range(curr, min(curr + 500, len(raw) - 9)):
-            length = struct.unpack_from('<I', raw, i)[0]
-            if (0 < length < 64
-                    and struct.unpack_from('<I', raw, i + 4)[0] == 0
-                    and 65 <= raw[i + 8] <= 90):
-                found = i
-                break
-        if found != -1:
-            r.seek(found)
+        # Personality stats (aggression, libido, inbredness).
+        # Exact offsets not yet documented; filled in by parse_save if found.
+        self.aggression  = None   # None = unknown
+        self.libido      = None
+        self.inbredness  = None
 
-        self.abilities = [a for a in [r.str() for _ in range(6)] if _valid_str(a)]
-        self.equipment = [s for s in [r.str() for _ in range(4)] if _valid_str(s)]
+        # Relationship scaffolds — resolved by parse_save after all cats loaded.
+        self._lover_uids: list[int] = []
+        self._hater_uids: list[int] = []
+        self.lovers: list['Cat'] = []
+        self.haters: list['Cat'] = []
 
-        # Mutations (up to 14 slots)
-        self.mutations = []
-        first = r.str()
-        if _valid_str(first):
-            self.mutations.append(first)
-        for _ in range(13):
-            if r.remaining() < 12:
-                break
-            flag = r.u32()
-            if flag == 0:
-                break
-            p = r.str()
-            if _valid_str(p):
-                self.mutations.append(p)
+        # ── Ability run — anchored on "DefaultMove" ─────────────────────────
+        # The ability block is a u64-length-prefixed ASCII identifier run.
+        # Structure (from open-source editor research):
+        #   items[0]  = "DefaultMove"  (active slot 1 default)
+        #   items[1-5] = active abilities 2-6
+        #   items[6-9] = padding / unknown slots
+        #   items[10]  = Passive1 mutation  (e.g. "Sturdy", "Longshot")
+        #   After run:  u32 tier, then 3 × [u64 id][u32 tier] tail entries
+        #               = Passive2, Disorder1, Disorder2
+        curr = r.pos
+        run_start = -1
+        for i in range(curr, min(curr + 600, len(raw) - 19)):
+            lo = struct.unpack_from('<I', raw, i)[0]
+            hi = struct.unpack_from('<I', raw, i + 4)[0]
+            if hi != 0 or not (1 <= lo <= 96):
+                continue
+            try:
+                cand = raw[i + 8: i + 8 + lo].decode('ascii')
+                if cand == 'DefaultMove':
+                    run_start = i
+                    break
+            except Exception:
+                continue
+
+        if run_start != -1:
+            r.seek(run_start)
+            # Read the full run until a non-identifier is encountered
+            run_items: list[str] = []
+            for _ in range(32):
+                saved = r.pos
+                item = r.str()
+                if item is None or not _IDENT_RE.match(item):
+                    r.seek(saved)
+                    break
+                run_items.append(item)
+
+            # Active abilities: items[1-5] (skip DefaultMove at [0])
+            self.abilities = [x for x in run_items[1:6] if _valid_str(x)]
+
+            # Passive mutations: item[10] then 3 tail tier-entries
+            passives: list[str] = []
+            if len(run_items) > 10 and _valid_str(run_items[10]):
+                passives.append(run_items[10])
+
+            try:
+                r.u32()   # passive1 tier — discard
+            except Exception:
+                pass
+
+            for _ in range(3):   # Passive2, Disorder1, Disorder2
+                saved = r.pos
+                item = r.str()
+                if item is None or not _IDENT_RE.match(item) or not _valid_str(item):
+                    r.seek(saved)
+                    break
+                passives.append(item)
+                try:
+                    r.u32()   # tier — discard
+                except Exception:
+                    pass
+
+            self.mutations = passives
+            self.equipment = []   # equipment parsing requires separate byte-marker logic
+
+        else:
+            # Fallback: old heuristic scan for any uppercase-starting ASCII string
+            found = -1
+            for i in range(curr, min(curr + 500, len(raw) - 9)):
+                length = struct.unpack_from('<I', raw, i)[0]
+                if (0 < length < 64
+                        and struct.unpack_from('<I', raw, i + 4)[0] == 0
+                        and 65 <= raw[i + 8] <= 90):
+                    found = i
+                    break
+            if found != -1:
+                r.seek(found)
+
+            self.abilities = [a for a in [r.str() for _ in range(6)] if _valid_str(a)]
+            self.equipment = [s for s in [r.str() for _ in range(4)] if _valid_str(s)]
+
+            self.mutations = []
+            first = r.str()
+            if _valid_str(first):
+                self.mutations.append(first)
+            for _ in range(13):
+                if r.remaining() < 12:
+                    break
+                flag = r.u32()
+                if flag == 0:
+                    break
+                p = r.str()
+                if _valid_str(p):
+                    self.mutations.append(p)
 
     # ── Display helpers ────────────────────────────────────────────────────
 
@@ -300,6 +406,30 @@ def can_breed(a: Cat, b: Cat) -> tuple[bool, str]:
     return False, f"Both cats are {label} — cannot produce offspring"
 
 
+# ── Compatibility check ───────────────────────────────────────────────────────
+
+def _compatibility(focus: 'Cat', other: 'Cat') -> str:
+    """
+    Returns one of: 'self' | 'incompatible' | 'risky' | 'ok'
+    Used to dim rows in the table when a single cat is selected.
+    """
+    if focus is other:
+        return 'self'
+    ok, _ = can_breed(focus, other)
+    if not ok:
+        return 'incompatible'
+    # Hate relationship
+    if other in getattr(focus, 'haters', []) or focus in getattr(other, 'haters', []):
+        return 'incompatible'
+    # Direct parent/offspring
+    if focus in get_parents(other) or other in get_parents(focus):
+        return 'incompatible'
+    # Shared ancestors → inbreeding risk
+    if find_common_ancestors(focus, other):
+        return 'risky'
+    return 'ok'
+
+
 # ── Save-file helpers ─────────────────────────────────────────────────────────
 
 def _get_house_info(conn) -> dict:
@@ -362,11 +492,24 @@ def parse_save(path: str) -> tuple[list, list]:
         except Exception as e:
             errors.append((key, str(e)))
 
-    # Resolve parent references by uniqueId
+    # Build UID lookup
     uid_map = {c._uid_int: c for c in cats}
+    uid_set = frozenset(uid_map.keys()) - {0}
+
+    # Two-pass parent resolution:
+    #   1st pass: try fixed-position UIDs read during parsing
+    #   2nd pass: if both are still None, scan the raw blob for pairs of known UIDs
     for cat in cats:
-        cat.parent_a = uid_map.get(cat._parent_uid_a) if cat._parent_uid_a else None
-        cat.parent_b = uid_map.get(cat._parent_uid_b) if cat._parent_uid_b else None
+        pa = uid_map.get(cat._parent_uid_a) if cat._parent_uid_a else None
+        pb = uid_map.get(cat._parent_uid_b) if cat._parent_uid_b else None
+
+        if pa is None and pb is None and uid_set and hasattr(cat, '_raw'):
+            sa, sb = _scan_blob_for_parent_uids(cat._raw, uid_set, cat._uid_int)
+            pa = uid_map.get(sa) if sa else None
+            pb = uid_map.get(sb) if sb else None
+
+        cat.parent_a = pa
+        cat.parent_b = pb
 
     return cats, errors
 
@@ -386,14 +529,14 @@ def find_save_files() -> list[str]:
 
 # ── Qt table model ────────────────────────────────────────────────────────────
 
-COLUMNS  = ["Name", "♀/♂", "Room", "Status"] + STAT_NAMES + ["Mutations", "Abilities"]
-COL_NAME = 0
-COL_GEN  = 1
-COL_ROOM = 2
-COL_STAT = 3
+COLUMNS   = ["Name", "♀/♂", "Room", "Status"] + STAT_NAMES + ["Abilities", "Mutations"]
+COL_NAME  = 0
+COL_GEN   = 1
+COL_ROOM  = 2
+COL_STAT  = 3
 STAT_COLS = list(range(4, 11))   # STR … LCK  (indices 4–10)
-COL_MUTS = 11
-COL_ABIL = 12
+COL_ABIL  = 11
+COL_MUTS  = 12
 
 # Fixed pixel widths for narrow columns
 _W_STATUS = 62
@@ -405,11 +548,21 @@ class CatTableModel(QAbstractTableModel):
     def __init__(self):
         super().__init__()
         self._cats: list[Cat] = []
+        self._focus_cat: Optional[Cat] = None
 
     def load(self, cats: list[Cat]):
         self.beginResetModel()
         self._cats = cats
         self.endResetModel()
+
+    def set_focus_cat(self, cat: Optional[Cat]):
+        self._focus_cat = cat
+        if self._cats:
+            self.dataChanged.emit(
+                self.index(0, 0),
+                self.index(len(self._cats) - 1, len(COLUMNS) - 1),
+                [Qt.BackgroundRole, Qt.ForegroundRole],
+            )
 
     def rowCount(self, parent=QModelIndex()):    return len(self._cats)
     def columnCount(self, parent=QModelIndex()): return len(COLUMNS)
@@ -443,13 +596,40 @@ class CatTableModel(QAbstractTableModel):
             return self.data(index, Qt.DisplayRole)
 
         elif role == Qt.BackgroundRole:
+            compat = (
+                _compatibility(self._focus_cat, cat)
+                if self._focus_cat is not None and cat is not self._focus_cat
+                else None
+            )
             if col in STAT_COLS:
-                val = cat.base_stats[STAT_NAMES[col - 4]]
-                return QBrush(STAT_COLORS.get(val, QColor(100, 100, 115)))
+                base_c = STAT_COLORS.get(cat.base_stats[STAT_NAMES[col - 4]], QColor(100, 100, 115))
+                if compat == 'incompatible':
+                    return QBrush(QColor(base_c.red() // 4, base_c.green() // 4, base_c.blue() // 4))
+                if compat == 'risky':
+                    return QBrush(QColor(base_c.red() // 2, base_c.green() // 2, base_c.blue() // 2))
+                return QBrush(base_c)
             if col == COL_STAT:
-                return QBrush(STATUS_COLOR.get(cat.status, QColor(80, 80, 90)))
+                sc = STATUS_COLOR.get(cat.status, QColor(80, 80, 90))
+                if compat == 'incompatible':
+                    return QBrush(QColor(sc.red() // 4, sc.green() // 4, sc.blue() // 4))
+                if compat == 'risky':
+                    return QBrush(QColor(sc.red() // 2, sc.green() // 2, sc.blue() // 2))
+                return QBrush(sc)
+            if compat == 'incompatible':
+                return QBrush(QColor(18, 12, 14))
+            if compat == 'risky':
+                return QBrush(QColor(22, 18, 10))
 
         elif role == Qt.ForegroundRole:
+            compat = (
+                _compatibility(self._focus_cat, cat)
+                if self._focus_cat is not None and cat is not self._focus_cat
+                else None
+            )
+            if compat == 'incompatible':
+                return QBrush(QColor(65, 55, 60))
+            if compat == 'risky':
+                return QBrush(QColor(130, 110, 60))
             if col in STAT_COLS or col == COL_STAT:
                 return QBrush(QColor(255, 255, 255))
 
@@ -657,6 +837,24 @@ class CatDetailPanel(QWidget):
             anc.addStretch()
             root.addLayout(anc)
 
+        # Lovers & haters
+        if cat.lovers or cat.haters:
+            root.addWidget(_vsep())
+            rel = QVBoxLayout(); rel.setSpacing(4)
+            if cat.lovers:
+                rel.addWidget(_sec("LOVERS"))
+                rel.addWidget(ChipRow([c.name for c in cat.lovers]))
+            if cat.haters:
+                rel.addWidget(_sec("HATERS"))
+                hl = ChipRow([c.name for c in cat.haters])
+                for i in range(hl.layout().count() - 1):  # tint hater chips red
+                    w = hl.layout().itemAt(i).widget()
+                    if w:
+                        w.setStyleSheet(w.styleSheet().replace("background:#252545", "background:#452020"))
+                rel.addWidget(hl)
+            rel.addStretch()
+            root.addLayout(rel)
+
         root.addStretch()
 
     # ── Breeding pair ──────────────────────────────────────────────────────
@@ -822,7 +1020,10 @@ class CatDetailPanel(QWidget):
         lc.addWidget(_sec("LINEAGE"))
         common    = find_common_ancestors(a, b)
         is_direct = (a in get_parents(b) or b in get_parents(a))
+        is_haters = (b in getattr(a, 'haters', []) or a in getattr(b, 'haters', []))
 
+        if is_haters:
+            lc.addWidget(QLabel("⚠  These cats hate each other", styleSheet=_WARN_STYLE))
         if is_direct:
             lc.addWidget(QLabel("⚠  Direct parent/offspring", styleSheet=_WARN_STYLE))
         elif common:
@@ -1044,11 +1245,11 @@ class MainWindow(QMainWindow):
         hh = self._table.horizontalHeader()
         # Default: resize to contents
         hh.setSectionResizeMode(QHeaderView.ResizeToContents)
-        # Mutations: interactive (user-resizable), reasonable default width
         # Abilities: stretch to fill remaining space
+        # Mutations: interactive (user-resizable), reasonable default width
+        hh.setSectionResizeMode(COL_ABIL, QHeaderView.Stretch)
         hh.setSectionResizeMode(COL_MUTS, QHeaderView.Interactive)
         self._table.setColumnWidth(COL_MUTS, 155)
-        hh.setSectionResizeMode(COL_ABIL, QHeaderView.Stretch)
         # Narrow fixed columns
         for col, width in [(COL_GEN, _W_GEN), (COL_STAT, _W_STATUS)] + \
                           [(c, _W_STAT) for c in STAT_COLS]:
@@ -1101,6 +1302,10 @@ class MainWindow(QMainWindow):
             panel_h = 200 if len(cats) == 1 else 300
             self._detail_splitter.setSizes([max(10, total - panel_h), panel_h])
 
+        # Highlight compatibility: dim incompatible cats when 1 is selected
+        focus = cats[0] if len(cats) == 1 else None
+        self._source_model.set_focus_cat(focus)
+
     # ── Filtering ──────────────────────────────────────────────────────────
 
     def _filter(self, room_key, btn: QPushButton):
@@ -1112,6 +1317,7 @@ class MainWindow(QMainWindow):
         self._update_header(room_key)
         self._update_count()
         self._detail.show_cats([])
+        self._source_model.set_focus_cat(None)
 
     def _update_header(self, room_key):
         if room_key is None:
