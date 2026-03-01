@@ -942,23 +942,41 @@ class CatDetailPanel(QWidget):
         id_col.addStretch()
         root.addLayout(id_col)
 
-        # Abilities
-        if cat.abilities:
+        # Abilities + Mutations — side-by-side with a draggable handle.
+        # Mutations is the stretch side; abilities stays compact on the left.
+        has_ab = bool(cat.abilities)
+        has_mu = bool(cat.mutations)
+        if has_ab or has_mu:
             root.addWidget(_vsep())
-            ab = QVBoxLayout(); ab.setSpacing(4)
-            ab.addWidget(_sec("ABILITIES"))
-            ab.addWidget(ChipRow(cat.abilities))
-            ab.addStretch()
-            root.addLayout(ab)
-
-        # Mutations
-        if cat.mutations:
-            root.addWidget(_vsep())
-            mu = QVBoxLayout(); mu.setSpacing(4)
-            mu.addWidget(_sec("MUTATIONS"))
-            mu.addWidget(ChipRow(cat.mutations))
-            mu.addStretch()
-            root.addLayout(mu)
+            am_split = QSplitter(Qt.Horizontal)
+            am_split.setHandleWidth(8)
+            am_split.setStyleSheet(
+                "QSplitter::handle:horizontal {"
+                " background:#18182e;"
+                " border-left:2px solid #303068; border-right:2px solid #303068; }"
+                "QSplitter::handle:horizontal:hover { background:#2a2a58; }")
+            if has_ab:
+                ab_w = QWidget()
+                ab = QVBoxLayout(ab_w)
+                ab.setContentsMargins(0, 0, 6, 0)
+                ab.setSpacing(4)
+                ab.addWidget(_sec("ABILITIES"))
+                ab.addWidget(ChipRow(cat.abilities))
+                ab.addStretch()
+                am_split.addWidget(ab_w)
+            if has_mu:
+                mu_w = QWidget()
+                mu = QVBoxLayout(mu_w)
+                mu.setContentsMargins(6, 0, 0, 0)
+                mu.setSpacing(4)
+                mu.addWidget(_sec("MUTATIONS"))
+                mu.addWidget(ChipRow(cat.mutations))
+                mu.addStretch()
+                am_split.addWidget(mu_w)
+            if has_ab and has_mu:
+                am_split.setStretchFactor(0, 0)  # abilities: compact
+                am_split.setStretchFactor(1, 1)  # mutations: takes extra space
+            root.addWidget(am_split, 1)           # splitter claims all extra panel width
 
         # Equipment
         if cat.equipment:
@@ -1008,8 +1026,6 @@ class CatDetailPanel(QWidget):
                 rel.addWidget(hl)
             rel.addStretch()
             root.addLayout(rel)
-
-        root.addStretch()
 
     # ── Breeding pair ──────────────────────────────────────────────────────
 
