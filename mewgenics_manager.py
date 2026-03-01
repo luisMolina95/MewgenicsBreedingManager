@@ -1838,7 +1838,16 @@ class MainWindow(QMainWindow):
             item = self._rooms_vb.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
-        rooms = sorted({c.room for c in cats if c.status == "In House" and c.room})
+        _ROOM_ORDER = {
+            "Attic": 0, "Attic_Large": 0,
+            "Floor2_Large": 1, "Floor2_Small": 2,
+            "Floor1_Large": 3, "Floor1_Small": 4,
+            "Basement": 5, "Basement_Large": 5,
+        }
+        rooms = sorted(
+            {c.room for c in cats if c.status == "In House" and c.room},
+            key=lambda r: _ROOM_ORDER.get(r, 99),
+        )
         for room in rooms:
             count = sum(1 for c in cats if c.room == room)
             display = ROOM_DISPLAY.get(room, room)
