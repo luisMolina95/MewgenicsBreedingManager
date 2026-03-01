@@ -798,6 +798,8 @@ class RoomFilterModel(QSortFilterProxyModel):
         cat = self.sourceModel().cat_at(source_row)
         if cat is None:
             return False
+        if self._room == "__all__":
+            return True
         if self._room is None:
             return cat.status != "Gone"
         if self._room == "__gone__":
@@ -914,8 +916,8 @@ class CatDetailPanel(QWidget):
 
         def _navigate(target: Cat):
             mw = self.window()
-            # Reset filter so the target is definitely visible in the table
-            mw._filter(None, mw._btn_all)
+            # Use "All Cats" view so gone/adventure cats are always reachable
+            mw._filter("__all__", mw._btn_everyone)
             for row in range(mw._source_model.rowCount()):
                 if mw._source_model.cat_at(row) is target:
                     proxy_idx = mw._proxy_model.mapFromSource(
@@ -1418,7 +1420,13 @@ class MainWindow(QMainWindow):
             return l
 
         vb.addWidget(sl("VIEW"))
-        self._btn_all = _sidebar_btn("All Cats")
+        self._btn_everyone = _sidebar_btn("All Cats")
+        self._btn_everyone.clicked.connect(
+            lambda: self._filter("__all__", self._btn_everyone))
+        vb.addWidget(self._btn_everyone)
+        self._room_btns["__all__"] = self._btn_everyone
+
+        self._btn_all = _sidebar_btn("Alive")
         self._btn_all.setChecked(True)
         self._active_btn = self._btn_all
         self._btn_all.clicked.connect(lambda: self._filter(None, self._btn_all))
@@ -1601,8 +1609,10 @@ class MainWindow(QMainWindow):
         self._source_model.set_focus_cat(None)
 
     def _update_header(self, room_key):
-        if room_key is None:
+        if room_key == "__all__":
             self._header_lbl.setText("All Cats")
+        elif room_key is None:
+            self._header_lbl.setText("Alive")
         elif room_key == "__gone__":
             self._header_lbl.setText("Gone")
         elif room_key == "__adventure__":
