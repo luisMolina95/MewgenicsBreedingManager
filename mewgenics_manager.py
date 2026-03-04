@@ -1072,6 +1072,7 @@ def parse_save(path: str) -> tuple[list, list]:
     for c in cats:
         if c.generation < 0:
             c.generation = 0
+    return cats, errors
 
 
 def find_save_files() -> list[str]:
